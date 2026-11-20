@@ -1,0 +1,29 @@
+{
+  "name": "@bailout-mcp/server",
+  "version": "0.1.0",
+  "description": "Local BailoutMCP Server, Shared Telemetry HTTP/SSE Bridge, File Churn Watcher, and CLI",
+  "type": "module",
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "bin": {
+    "bailout-mcp": "./dist/src/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/src/cli.js",
+    "daemon": "node dist/src/cli.js daemon",
+    "doctor": "node dist/src/cli.js doctor",
+    "test": "node --test dist/test/*.test.js",
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\""
+  },
+  "dependencies": {
+    "@bailout-mcp/core": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.8.2"
+  }
+}

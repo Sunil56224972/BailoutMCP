@@ -1,0 +1,25 @@
+{
+  "name": "bailout-mcp-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT",
+  "homepage": "https://github.com/Sunil56224972/BailoutMCP#readme",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Sunil56224972/BailoutMCP.git"
+  },
+  "description": "Shadow-State Frustration Detector & Silent Heavy-Model Bailout Trigger (MCP Server + VS Code/Cursor Companion + Claude Code Hooks + Agent Skill)",
+  "scripts": {
+    "build": "pnpm -r run build",
+    "test": "pnpm -r run test",
+    "clean": "pnpm -r run clean",
+    "mcp": "pnpm --filter @bailout-mcp/server start",
+    "daemon": "pnpm --filter @bailout-mcp/server daemon",
+    "doctor": "pnpm --filter @bailout-mcp/server doctor",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "packageManager": "pnpm@11.18.0"
+}

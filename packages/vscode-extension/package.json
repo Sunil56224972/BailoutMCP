@@ -1,0 +1,76 @@
+{
+  "name": "bailout-mcp-vscode",
+  "displayName": "BailoutMCP — Shadow-State Companion",
+  "description": "Privacy-first local behavioral telemetry companion (Ctrl+Z bursts, edit churn, LSP diagnostics, terminal errors) with pause-gated silent heavy-model Bailout diffs.",
+  "version": "0.1.0",
+  "publisher": "bailout-mcp",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "bailout.showStatus",
+        "title": "BailoutMCP: Show Shadow-State Status"
+      },
+      {
+        "command": "bailout.viewDiff",
+        "title": "BailoutMCP: View Pre-Solved Bailout Diff"
+      },
+      {
+        "command": "bailout.applyFix",
+        "title": "BailoutMCP: Apply Bailout Fix"
+      },
+      {
+        "command": "bailout.dismissFix",
+        "title": "BailoutMCP: Dismiss Bailout Fix"
+      },
+      {
+        "command": "bailout.triggerNow",
+        "title": "BailoutMCP: Trigger Heavy-Model Bailout Now"
+      },
+      {
+        "command": "bailout.toggleEnabled",
+        "title": "BailoutMCP: Pause / Resume Telemetry"
+      }
+    ],
+    "configuration": {
+      "title": "BailoutMCP",
+      "properties": {
+        "bailout.enabled": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable local-only Shadow-State behavioral signal tracking."
+        },
+        "bailout.autoToastOnPause": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show a non-intrusive toast when a silently pre-solved heavy-model fix clears the natural pause gate."
+        },
+        "bailout.bridgePort": {
+          "type": "number",
+          "default": 47821,
+          "description": "Fallback port if ~/.bailout-mcp/bridge.json is not present."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node -e \"console.log('vscode-extension typecheck/build verified')\"",
+    "clean": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/vscode": "^1.93.0",
+    "typescript": "^5.8.2"
+  }
+}
