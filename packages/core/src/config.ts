@@ -61,6 +61,9 @@ const VALID_PROVIDERS: ReadonlySet<string> = new Set<BailoutProviderKind>([
 ]);
 
 export function getGlobalConfigDir(): string {
+  if (process.env.BAILOUT_HOME && process.env.BAILOUT_HOME.trim()) {
+    return path.resolve(process.env.BAILOUT_HOME.trim());
+  }
   return path.join(os.homedir(), '.bailout-mcp');
 }
 
@@ -98,6 +101,9 @@ function loadDotEnvFiles(paths: string[]): Record<string, string> {
           (val.startsWith("'") && val.endsWith("'"))
         ) {
           val = val.slice(1, -1);
+        } else {
+          // Strip unquoted inline comments (e.g. `BAILOUT_STUCK_THRESHOLD=70 # default`)
+          val = val.replace(/\s+#.*$/, '').trim();
         }
         if (key && val !== '') {
           vars[key] = val;
@@ -314,6 +320,9 @@ export function loadConfig(
   const stuckThreshold = getNumEnv('BAILOUT_STUCK_THRESHOLD');
   if (stuckThreshold !== undefined) config.stuckThreshold = stuckThreshold;
 
+  const frictionThreshold = getNumEnv('BAILOUT_FRICTION_THRESHOLD');
+  if (frictionThreshold !== undefined) config.frictionThreshold = frictionThreshold;
+
   const pauseGateMs = getNumEnv('BAILOUT_PAUSE_GATE_MS');
   if (pauseGateMs !== undefined) config.pauseGateMs = pauseGateMs;
 
@@ -348,9 +357,80 @@ export function loadConfig(
       .map((r) => path.resolve(r));
   }
 
+  const explicitRootsConfigured = Boolean(
+    overrides?.explicitRootsLocked ||
+      (overrides?.allowedWorkspaceRoots && overrides.allowedWorkspaceRoots.length > 0) ||
+      allowedRootsRaw ||
+      (projectCfg?.allowedWorkspaceRoots && projectCfg.allowedWorkspaceRoots.length > 0) ||
+      (globalCfg?.allowedWorkspaceRoots && globalCfg.allowedWorkspaceRoots.length > 0),
+  );
+
   const finalConfig = deepMergeConfig(config, overrides);
+  finalConfig.explicitRootsLocked = explicitRootsConfigured;
+  if (finalConfig.frictionThreshold > finalConfig.stuckThreshold) {
+    finalConfig.frictionThreshold = Math.max(10, finalConfig.stuckThreshold - 10);
+  }
   if (finalConfig.allowedWorkspaceRoots.length === 0 && finalConfig.workspaceRoot) {
     finalConfig.allowedWorkspaceRoots = [path.resolve(finalConfig.workspaceRoot)];
   }
   return finalConfig;
+}
+
+const ALLOWED_RUNTIME_PROVIDERS: ReadonlySet<string> = VALID_PROVIDERS;
+
+/**
+ * Strictly filters untrusted IPC/MCP runtime config updates to safe non-secret tuning knobs.
+ * API keys, endpoint URLs, headers, and allowedWorkspaceRoots can NEVER be mutated via IPC/MCP.
+ */
+export function pickSafeConfigUpdate(body: Record<string, unknown>): Partial<BailoutConfig> {
+  const safe: Partial<BailoutConfig> = {};
+
+  if (typeof body.provider === 'string' && ALLOWED_RUNTIME_PROVIDERS.has(body.provider)) {
+    safe.provider = body.provider as BailoutProviderKind;
+  }
+  if (
+    typeof body.stuckThreshold === 'number' &&
+    Number.isFinite(body.stuckThreshold) &&
+    body.stuckThreshold >= 20 &&
+    body.stuckThreshold <= 100
+  ) {
+    safe.stuckThreshold = body.stuckThreshold;
+  }
+  if (
+    typeof body.frictionThreshold === 'number' &&
+    Number.isFinite(body.frictionThreshold) &&
+    body.frictionThreshold >= 10 &&
+    body.frictionThreshold <= 95
+  ) {
+    safe.frictionThreshold = body.frictionThreshold;
+  }
+  if (
+    typeof body.pauseGateMs === 'number' &&
+    Number.isFinite(body.pauseGateMs) &&
+    body.pauseGateMs >= 500 &&
+    body.pauseGateMs <= 30_000
+  ) {
+    safe.pauseGateMs = body.pauseGateMs;
+  }
+  if (
+    typeof body.cooldownMs === 'number' &&
+    Number.isFinite(body.cooldownMs) &&
+    body.cooldownMs >= 10_000 &&
+    body.cooldownMs <= 3_600_000
+  ) {
+    safe.cooldownMs = body.cooldownMs;
+  }
+  if (
+    typeof body.minConfidence === 'number' &&
+    Number.isFinite(body.minConfidence) &&
+    body.minConfidence >= 0.3 &&
+    body.minConfidence <= 0.99
+  ) {
+    safe.minConfidence = body.minConfidence;
+  }
+  if (typeof body.autoSolve === 'boolean') {
+    safe.autoSolve = body.autoSolve;
+  }
+
+  return safe;
 }

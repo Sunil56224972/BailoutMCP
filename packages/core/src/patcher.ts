@@ -23,28 +23,80 @@ function lineNumberAtOffset(normalizedText: string, charOffset: number): number 
   return line;
 }
 
-function buildUnifiedDiff(
+const NUMBERED_LINE_PREFIX_RE = /^\s*\d+\s*\|\s?/;
+
+function stripDossierLinePrefixes(code: string): string {
+  const lines = code.split('\n');
+  const nonEmpty = lines.filter((l) => l.trim().length > 0);
+  if (nonEmpty.length > 0 && nonEmpty.every((l) => NUMBERED_LINE_PREFIX_RE.test(l))) {
+    return lines.map((l) => l.replace(NUMBERED_LINE_PREFIX_RE, '')).join('\n');
+  }
+  return code;
+}
+
+function computeChangedStatsAndDiff(
   filePath: string,
   startLine: number,
   originalCode: string,
   fixedCode: string,
-): string {
+): { unifiedDiff: string; linesChanged: number } {
   const base = path.basename(filePath);
   const oldLines = normalizeEol(originalCode).split('\n');
   const newLines = normalizeEol(fixedCode).split('\n');
 
+  let prefixLen = 0;
+  while (
+    prefixLen < oldLines.length &&
+    prefixLen < newLines.length &&
+    oldLines[prefixLen] === newLines[prefixLen]
+  ) {
+    prefixLen += 1;
+  }
+
+  let suffixLen = 0;
+  while (
+    suffixLen < oldLines.length - prefixLen &&
+    suffixLen < newLines.length - prefixLen &&
+    oldLines[oldLines.length - 1 - suffixLen] === newLines[newLines.length - 1 - suffixLen]
+  ) {
+    suffixLen += 1;
+  }
+
+  const contextPre = oldLines.slice(Math.max(0, prefixLen - 2), prefixLen);
+  const removed = oldLines.slice(prefixLen, oldLines.length - suffixLen);
+  const added = newLines.slice(prefixLen, newLines.length - suffixLen);
+  const contextPost = oldLines.slice(
+    oldLines.length - suffixLen,
+    Math.min(oldLines.length, oldLines.length - suffixLen + 2),
+  );
+
+  const hunkStart = startLine + Math.max(0, prefixLen - 2);
+  const hunkOldCount = contextPre.length + removed.length + contextPost.length;
+  const hunkNewCount = contextPre.length + added.length + contextPost.length;
+
   const header = [
     `--- a/${base}`,
     `+++ b/${base}`,
-    `@@ -${startLine},${oldLines.length} +${startLine},${newLines.length} @@`,
+    `@@ -${hunkStart},${hunkOldCount} +${hunkStart},${hunkNewCount} @@`,
   ];
 
   const body = [
-    ...oldLines.map((line) => `-${line}`),
-    ...newLines.map((line) => `+${line}`),
+    ...contextPre.map((line) => ` ${line}`),
+    ...removed.map((line) => `-${line}`),
+    ...added.map((line) => `+${line}`),
+    ...contextPost.map((line) => ` ${line}`),
   ];
 
-  return [...header, ...body].join('\n');
+  const linesChanged = Math.max(1, Math.max(removed.length, added.length));
+  return {
+    unifiedDiff: [...header, ...body].join('\n'),
+    linesChanged,
+  };
+}
+
+function leadingWhitespace(line: string): string {
+  const m = line.match(/^[ \t]*/);
+  return m ? m[0] : '';
 }
 
 export interface ValidatePatchOptions {
@@ -64,23 +116,26 @@ export function validateAndBuildPatch(
 ): ValidatedPatchResult | null {
   const hasCrlf = fileContent.includes('\r\n');
   const normalizedFile = normalizeEol(fileContent);
-  const normalizedOriginal = normalizeEol(raw.originalCode);
-  const normalizedFixed = normalizeEol(raw.fixedCode);
+  let normalizedOriginal = normalizeEol(raw.originalCode);
+  let normalizedFixed = normalizeEol(raw.fixedCode);
+
+  // Recover cleanly if a model accidentally copied "  12 | " line-number prefixes from the dossier
+  if (!normalizedFile.includes(normalizedOriginal)) {
+    const strippedOrig = stripDossierLinePrefixes(normalizedOriginal);
+    if (strippedOrig !== normalizedOriginal) {
+      normalizedOriginal = strippedOrig;
+      normalizedFixed = stripDossierLinePrefixes(normalizedFixed);
+    }
+  }
 
   if (!normalizedOriginal.trim()) return null;
   if (normalizedOriginal === normalizedFixed) return null;
 
-  const safety = validatePatchSafety(
-    normalizedOriginal,
-    normalizedFixed,
-    options.maxPatchLines ?? 35,
-  );
-  if (!safety.safe) {
-    return null;
-  }
+  const maxPatchLines = options.maxPatchLines ?? 35;
 
   let matchIndex = -1;
   let actualOriginal = normalizedOriginal;
+  let adjustedFixed = normalizedFixed;
   let bestLineDistance = Number.POSITIVE_INFINITY;
   let totalMatches = 0;
 
@@ -126,6 +181,61 @@ export function validateAndBuildPatch(
     }
   }
 
+  // 3. Fallback: uniform leading-indentation-delta recovery (handles local models shifting indent)
+  if (matchIndex === -1) {
+    const fileLines = normalizedFile.split('\n');
+    const origLines = normalizedOriginal.split('\n');
+    const strippedOrig = origLines.map((l) => l.trim());
+    const nonEmptyOrigIndices = origLines
+      .map((l, idx) => (l.trim().length > 0 ? idx : -1))
+      .filter((idx) => idx !== -1);
+
+    if (nonEmptyOrigIndices.length > 0) {
+      const baseOrigIndent = leadingWhitespace(origLines[nonEmptyOrigIndices[0]]).length;
+      for (let i = 0; i <= fileLines.length - origLines.length; i++) {
+        let ok = true;
+        for (let j = 0; j < origLines.length; j++) {
+          if (fileLines[i + j].trim() !== strippedOrig[j]) {
+            ok = false;
+            break;
+          }
+        }
+        if (!ok) continue;
+
+        const baseFileIndentStr = leadingWhitespace(fileLines[i + nonEmptyOrigIndices[0]]);
+        // Verify uniform indentation offset across all non-empty lines
+        const indentDelta = baseFileIndentStr.length - baseOrigIndent;
+        const uniform = nonEmptyOrigIndices.every(
+          (j) =>
+            leadingWhitespace(fileLines[i + j]).length - leadingWhitespace(origLines[j]).length ===
+            indentDelta,
+        );
+        if (!uniform) continue;
+
+        const candidateLine = i + 1;
+        const lineDist = Math.abs(candidateLine - raw.startLine);
+        if (lineDist > 12) continue;
+
+        totalMatches += 1;
+        if (lineDist < bestLineDistance) {
+          bestLineDistance = lineDist;
+          actualOriginal = fileLines.slice(i, i + origLines.length).join('\n');
+          matchIndex = i === 0 ? 0 : fileLines.slice(0, i).join('\n').length + 1;
+          const indentUnit = baseFileIndentStr.includes('\t') ? '\t' : ' ';
+          adjustedFixed = normalizedFixed
+            .split('\n')
+            .map((fl) => {
+              if (!fl.trim()) return '';
+              const curIndent = leadingWhitespace(fl).length;
+              const nextIndent = Math.max(0, curIndent + indentDelta);
+              return indentUnit.repeat(nextIndent) + fl.trimStart();
+            })
+            .join('\n');
+        }
+      }
+    }
+  }
+
   if (matchIndex === -1) {
     return null;
   }
@@ -135,22 +245,43 @@ export function validateAndBuildPatch(
     return null;
   }
 
+  const { unifiedDiff, linesChanged } = computeChangedStatsAndDiff(
+    filePath,
+    lineNumberAtOffset(normalizedFile, matchIndex),
+    actualOriginal,
+    adjustedFixed,
+  );
+
+  // Validate safety against actual changed size and dangerous newly-introduced patterns
+  const safety = validatePatchSafety(actualOriginal, adjustedFixed, maxPatchLines);
+  if (!safety.safe && linesChanged > maxPatchLines) {
+    return null;
+  }
+  if (!safety.safe) {
+    // Allow slightly larger surrounding context block ONLY if actual modified lines <= maxPatchLines
+    // AND no dangerous pattern was introduced
+    const patternSafety = validatePatchSafety(
+      actualOriginal,
+      adjustedFixed,
+      Math.max(maxPatchLines, actualOriginal.split('\n').length, adjustedFixed.split('\n').length),
+    );
+    if (!patternSafety.safe || linesChanged > maxPatchLines) {
+      return null;
+    }
+  }
+
   const startLine = lineNumberAtOffset(normalizedFile, matchIndex);
   const origLineCount = actualOriginal.split('\n').length;
   const endLine = startLine + origLineCount - 1;
 
   const patchedNormalized =
     normalizedFile.slice(0, matchIndex) +
-    normalizedFixed +
+    adjustedFixed +
     normalizedFile.slice(matchIndex + actualOriginal.length);
 
   const patchedFullContent = hasCrlf
     ? patchedNormalized.replace(/\n/g, '\r\n')
     : patchedNormalized;
-
-  const oldSet = actualOriginal.split('\n');
-  const newSet = normalizedFixed.split('\n');
-  const linesChanged = Math.max(oldSet.length, newSet.length);
 
   return {
     patch: {
@@ -158,8 +289,8 @@ export function validateAndBuildPatch(
       startLine,
       endLine,
       originalCode: actualOriginal,
-      fixedCode: normalizedFixed,
-      unifiedDiff: buildUnifiedDiff(filePath, startLine, actualOriginal, normalizedFixed),
+      fixedCode: adjustedFixed,
+      unifiedDiff,
       linesChanged,
     },
     patchedFullContent,

@@ -54,44 +54,113 @@ const MAX_ATTEMPTED_FIXES = 8;
 const MAX_TRACKED_FILES = 200;
 const STALE_FILE_TTL_MS = 30 * 60 * 1000;
 
-const STACK_FILE_LOC_RE =
-  /(?:([A-Za-z]:\\[^:\s()"']+\.[A-Za-z0-9]{1,6})|((?:\.{0,2}\/)?[A-Za-z0-9_./-]+\.[A-Za-z0-9]{1,6}))(?::(\d+)(?::\d+)?|\((\d+),\d+\))/;
+const THIRD_PARTY_OR_BUILD_SEGMENTS = new Set([
+  'node_modules',
+  '.pnpm',
+  'dist',
+  'build',
+  'out',
+  '.next',
+  '.turbo',
+  'vendor',
+  'site-packages',
+  '.venv',
+  'venv',
+  'target',
+]);
+
+const STACK_PATTERNS: Array<{ re: RegExp; pathIdx: number; lineIdx: number }> = [
+  // Python traceback: File "/path/to/app.py", line 42
+  { re: /File "([^"\r\n]+\.[A-Za-z0-9]{1,8})",\s*line\s+(\d+)/g, pathIdx: 1, lineIdx: 2 },
+  // Rust compiler: --> src/main.rs:12:5
+  { re: /-->\s+([^\s:()"']+\.[A-Za-z0-9]{1,8}):(\d+)(?::\d+)?/g, pathIdx: 1, lineIdx: 2 },
+  // Windows drive path (both C:\ and C:/), supporting :line:col or (line,col)
+  {
+    re: /([A-Za-z]:[\\/][^:\r\n()"']+?\.[A-Za-z0-9]{1,8})(?::(\d+)(?::\d+)?|\((\d+),\d+\))/g,
+    pathIdx: 1,
+    lineIdx: 2,
+  },
+  // POSIX / relative path (including Next.js [id], (group), @scope), supporting :line:col or (line,col)
+  {
+    re: /((?:\.{0,2}[\\/])?[A-Za-z0-9_.@[\]()/-]+\.[A-Za-z0-9]{1,8})(?::(\d+)(?::\d+)?|\((\d+),\d+\))/g,
+    pathIdx: 1,
+    lineIdx: 2,
+  },
+];
+
+function isThirdPartyOrBuildPath(resolvedPath: string): boolean {
+  const segments = resolvedPath.split(/[\\/]/).map((s) => s.toLowerCase());
+  return segments.some((seg) => THIRD_PARTY_OR_BUILD_SEGMENTS.has(seg));
+}
 
 /**
- * Extracts a real existing source file path and line number from compiler/test
- * stack traces when a CLI command fails without an explicit `filePath`.
+ * Extracts a real existing user source file path and line number from multi-frame
+ * compiler/test/runtime stack traces (JS/TS, Python, Rust, Go, Java, C#) when a CLI
+ * command fails without an explicit `filePath`. Prioritizes workspace source files
+ * and refuses to blame `node_modules` / `site-packages` / build output directories.
  */
 function inferFileFromErrorText(
   message: string | undefined,
   workspaceRoot: string | undefined,
 ): { filePath: string; line?: number } | undefined {
   if (!message) return undefined;
-  const match = message.match(STACK_FILE_LOC_RE);
-  if (!match) return undefined;
 
-  const rawPath = match[1] ?? match[2];
-  if (!rawPath || rawPath.startsWith('node:')) return undefined;
+  const seen = new Set<string>();
+  const candidates: Array<{ filePath: string; line?: number; isInWorkspace: boolean }> = [];
+  const normalizedRoot = workspaceRoot ? normalizeFilePath(workspaceRoot) : undefined;
 
-  const candidate = path.isAbsolute(rawPath)
-    ? rawPath
-    : workspaceRoot
-      ? path.resolve(workspaceRoot, rawPath)
-      : path.resolve(rawPath);
+  for (const { re, pathIdx, lineIdx } of STACK_PATTERNS) {
+    re.lastIndex = 0;
+    for (const match of message.matchAll(re)) {
+      const rawPath = match[pathIdx]?.trim();
+      if (
+        !rawPath ||
+        rawPath.startsWith('node:') ||
+        rawPath.startsWith('internal/') ||
+        rawPath.startsWith('http://') ||
+        rawPath.startsWith('https://') ||
+        rawPath.startsWith('webpack:')
+      ) {
+        continue;
+      }
 
-  if (isSensitiveFilePath(candidate)) return undefined;
-  try {
-    if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
-      return undefined;
+      const candidate = path.isAbsolute(rawPath)
+        ? path.normalize(rawPath)
+        : workspaceRoot
+          ? path.resolve(workspaceRoot, rawPath)
+          : path.resolve(rawPath);
+
+      const key = normalizeFilePath(candidate);
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      if (isSensitiveFilePath(candidate) || isThirdPartyOrBuildPath(candidate)) {
+        continue;
+      }
+
+      try {
+        if (!fs.existsSync(candidate) || !fs.statSync(candidate).isFile()) {
+          continue;
+        }
+      } catch {
+        continue;
+      }
+
+      const rawLine = match[lineIdx] ?? match[lineIdx + 1];
+      const lineNum = Number(rawLine);
+      const isInWorkspace = normalizedRoot
+        ? key === normalizedRoot || key.startsWith(normalizedRoot + path.sep)
+        : true;
+
+      candidates.push({
+        filePath: candidate,
+        line: Number.isFinite(lineNum) && lineNum > 0 ? lineNum : undefined,
+        isInWorkspace,
+      });
     }
-  } catch {
-    return undefined;
   }
 
-  const lineNum = Number(match[3] ?? match[4]);
-  return {
-    filePath: candidate,
-    line: Number.isFinite(lineNum) && lineNum > 0 ? lineNum : undefined,
-  };
+  return candidates.find((c) => c.isInWorkspace) ?? candidates[0];
 }
 
 export interface IngestOutcome {
@@ -378,6 +447,11 @@ export class ShadowStateTracker {
     state.undoCount = 0;
     state.churnCount = 0;
     state.oscillationCount = 0;
+  }
+
+  resetAll(): void {
+    this.files.clear();
+    this.activeFileKey = undefined;
   }
 
   getHotspot(filePath: string, now = Date.now()): FileHotspot | undefined {

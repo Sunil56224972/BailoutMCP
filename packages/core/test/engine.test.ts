@@ -299,3 +299,82 @@ test('BailoutEngine auto-invalidates queued bailout on micro-win error resolutio
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('BailoutEngine previewDossier works without API keys, resetState clears friction, and external drift un-wedges pendingBailout', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bailout-preview-drift-'));
+  const filePath = path.join(tmpDir, 'Store.ts');
+  fs.writeFileSync(filePath, 'export let count = 0;\nexport function inc() { count = count + 1; }\n', 'utf8');
+
+  const { server, baseUrl } = await startTestRouterServer(() => ({
+    rootCause: 'Needs atomic increment',
+    summary: 'Increment count cleanly',
+    explanation: 'Use += 1.',
+    whyPreviousAttemptsFailed: '',
+    confidence: 0.9,
+    patch: {
+      startLine: 2,
+      endLine: 2,
+      originalCode: 'export function inc() { count = count + 1; }',
+      fixedCode: 'export function inc() { count += 1; }',
+    },
+  }));
+
+  try {
+    // 1. Offline / unconfigured engine still produces full redacted previewDossier
+    const offlineEngine = new BailoutEngine({
+      workspaceRoot: tmpDir,
+      allowedWorkspaceRoots: [tmpDir],
+      provider: 'anthropic',
+      providers: {
+        anthropic: { apiKey: '', model: 'claude-opus-4-6' },
+        gemini: { apiKey: '', model: 'gemini-2.5-pro' },
+        openai: { apiKey: '', model: 'o3' },
+        openrouter: { apiKey: '', model: 'anthropic/claude-opus-4.6' },
+        ollama: { model: '', baseUrl: '' },
+        custom: { model: '', baseUrl: '' },
+      },
+    });
+    offlineEngine.ingest({ kind: 'terminal_error', filePath, message: 'Error on Store.ts:2' });
+    const preview = offlineEngine.previewDossier(filePath);
+    assert.equal(preview.relativePath, 'Store.ts');
+    assert.ok(preview.numberedCodeWindow.includes('count = count + 1'));
+
+    // 2. External file drift auto-invalidates pending bailout instead of wedging engine
+    const liveEngine = new BailoutEngine({
+      workspaceRoot: tmpDir,
+      allowedWorkspaceRoots: [tmpDir],
+      provider: 'custom',
+      autoSolve: false,
+      providers: {
+        anthropic: { model: 'claude-opus-4-6' },
+        gemini: { model: 'gemini-2.5-pro' },
+        openai: { model: 'o3' },
+        openrouter: { model: 'anthropic/claude-opus-4.6' },
+        ollama: { model: 'qwen2.5-coder:32b', baseUrl: 'http://127.0.0.1:11434/api/chat' },
+        custom: { model: 'test-model', baseUrl },
+      },
+    });
+
+    const proposal = await liveEngine.triggerBailout({
+      filePath,
+      errorMessage: 'Race condition in inc()',
+      attemptedFix: 'Tried manual lock',
+      startLine: 2,
+      force: true,
+    });
+    assert.ok(proposal.id);
+
+    // Simulate external git checkout modifying target line on disk
+    fs.writeFileSync(filePath, 'export let count = 0;\nexport function inc() { count = 999; }\n', 'utf8');
+    assert.equal(liveEngine.getPendingBailout(true), undefined);
+    assert.notEqual(liveEngine.getSnapshot().phase, 'BAILOUT_READY');
+
+    // Reset state clears score back to 0
+    const afterReset = liveEngine.resetState();
+    assert.equal(afterReset.score, 0);
+    assert.equal(afterReset.phase, 'FLOW');
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

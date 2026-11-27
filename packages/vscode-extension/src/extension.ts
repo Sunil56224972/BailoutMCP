@@ -53,7 +53,11 @@ interface ShadowStateDto {
 }
 
 function readBridgeManifest(): BridgeManifest | undefined {
-  const manifestPath = path.join(os.homedir(), '.bailout-mcp', 'bridge.json');
+  const dir =
+    process.env.BAILOUT_HOME && process.env.BAILOUT_HOME.trim()
+      ? path.resolve(process.env.BAILOUT_HOME.trim())
+      : path.join(os.homedir(), '.bailout-mcp');
+  const manifestPath = path.join(dir, 'bridge.json');
   try {
     if (!fs.existsSync(manifestPath)) return undefined;
     const parsed = JSON.parse(fs.readFileSync(manifestPath, 'utf8')) as Partial<BridgeManifest>;
@@ -78,7 +82,8 @@ function lineNumberAtOffset(text: string, charOffset: number): number {
 
 /**
  * Finds the exact occurrence of `needle` inside `haystack` closest in LINE NUMBER
- * to `preferredStartLine` (1-indexed), immune to CRLF vs LF line endings.
+ * to `preferredStartLine` (1-indexed), immune to CRLF vs LF line endings and rejecting
+ * ambiguous distant duplicate matches so wrong functions are never patched.
  */
 function findClosestSnippetOffset(
   haystack: string,
@@ -88,10 +93,12 @@ function findClosestSnippetOffset(
   let searchFrom = 0;
   let bestIdx = -1;
   let bestLineDist = Number.POSITIVE_INFINITY;
+  let totalMatches = 0;
 
   while (searchFrom <= haystack.length) {
     const idx = haystack.indexOf(needle, searchFrom);
     if (idx === -1) break;
+    totalMatches += 1;
     const candidateLine = lineNumberAtOffset(haystack, idx);
     const lineDist = Math.abs(candidateLine - preferredStartLine);
     if (lineDist < bestLineDist) {
@@ -99,6 +106,10 @@ function findClosestSnippetOffset(
       bestIdx = idx;
     }
     searchFrom = idx + 1;
+  }
+
+  if (totalMatches > 1 && bestLineDist > 15) {
+    return -1;
   }
 
   return bestIdx;

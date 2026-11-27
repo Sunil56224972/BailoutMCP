@@ -179,6 +179,8 @@ export interface BailoutDossier {
   frustrationScore: number;
   triggerReasons: string[];
   hotspotRange: LineRange;
+  /** Optional redacted top-of-file imports / type declarations when code window starts below line 1 */
+  topOfFileContext?: string;
   numberedCodeWindow: string;
   rawCodeWindow: string;
   windowStartLine: number;
@@ -264,6 +266,8 @@ export interface BailoutConfig {
   workspaceRoot?: string;
   /** Allowed workspace roots for strict path-traversal protection */
   allowedWorkspaceRoots: string[];
+  /** True when allowedWorkspaceRoots was explicitly pinned via env, config file, or constructor */
+  explicitRootsLocked?: boolean;
 }
 
 export interface RawModelBailoutResponse {

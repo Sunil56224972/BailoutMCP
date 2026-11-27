@@ -116,6 +116,37 @@ test('loadConfig reads workspace .env file and updateConfig strips undefined fie
   }
 });
 
+test('loadConfig strips inline .env comments and locks BAILOUT_ALLOWED_ROOTS defined in .env', () => {
+  const strictDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bailout-strict-root-'));
+  const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bailout-other-root-'));
+  fs.writeFileSync(
+    path.join(strictDir, '.env'),
+    [
+      'BAILOUT_PROVIDER=ollama # local offline model',
+      'BAILOUT_STUCK_THRESHOLD=68 # custom threshold',
+      `BAILOUT_ALLOWED_ROOTS="${strictDir}"`,
+    ].join('\n'),
+    'utf8',
+  );
+
+  try {
+    const engine = new BailoutEngine({ workspaceRoot: strictDir });
+    assert.equal(engine.getConfig().provider, 'ollama');
+    assert.equal(engine.getConfig().stuckThreshold, 68);
+
+    // Signal reporting another workspaceRoot MUST NOT expand locked allowedWorkspaceRoots from .env
+    engine.ingest({
+      kind: 'file_focus',
+      filePath: path.join(strictDir, 'a.ts'),
+      workspaceRoot: otherDir,
+    });
+    assert.deepEqual(engine.getConfig().allowedWorkspaceRoots, [path.resolve(strictDir)]);
+  } finally {
+    fs.rmSync(strictDir, { recursive: true, force: true });
+    fs.rmSync(otherDir, { recursive: true, force: true });
+  }
+});
+
 test('sanitizeConfigForDisplay never leaks API keys and constantTimeEqual validates accurately', () => {
   const fakeAnt = ['sk', 'ant', 'super-secret-value'].join('-');
   const fakeGem = ['AIza', 'SySecretKey1234567890'].join('');

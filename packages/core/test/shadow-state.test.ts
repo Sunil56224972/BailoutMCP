@@ -39,19 +39,68 @@ test('switching away to File B does not credit File B elapsed time onto File A d
 test('CLI terminal/agent error without explicit filePath infers real source file & line from stack trace', () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bailout-stack-'));
   const targetFile = path.join(tmpDir, 'CartService.ts');
+  const nmDir = path.join(tmpDir, 'node_modules', 'expect');
+  fs.mkdirSync(nmDir, { recursive: true });
+  const nmFile = path.join(nmDir, 'index.js');
+  fs.writeFileSync(nmFile, 'module.exports = {};\n', 'utf8');
   fs.writeFileSync(targetFile, 'export function calc() {\n  return 1;\n}\n', 'utf8');
 
   try {
     const tracker = new ShadowStateTracker(loadConfig({ workspaceRoot: tmpDir }));
+    // Put node_modules frame FIRST to verify BailoutMCP skips third-party frames and picks CartService.ts!
     const outcome = tracker.ingest({
       kind: 'agent_tool_error',
       workspaceRoot: tmpDir,
-      message: `TypeError: Cannot read properties of undefined\n    at calc (${targetFile}:2:10)`,
+      message: `Error: expect(received).toBe(2)\n    at Object.toBe (${nmFile}:1:1)\n    at calc (${targetFile}:2:10)`,
     });
 
     assert.ok(outcome.hotspot);
     assert.equal(path.resolve(outcome.hotspot.filePath), path.resolve(targetFile));
     assert.equal(outcome.hotspot.hotspotRange?.startLine, 2);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('stack trace inference supports Python tracebacks, Rust errors, and Next.js [id] routes', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'bailout-multilang-'));
+  const pyFile = path.join(tmpDir, 'worker.py');
+  const rustFile = path.join(tmpDir, 'main.rs');
+  const nextDir = path.join(tmpDir, 'app', 'users', '[id]');
+  fs.mkdirSync(nextDir, { recursive: true });
+  const nextFile = path.join(nextDir, 'page.tsx');
+
+  fs.writeFileSync(pyFile, 'def run():\n    return 1 / 0\n', 'utf8');
+  fs.writeFileSync(rustFile, 'fn main() {\n    let x: i32 = "bad";\n}\n', 'utf8');
+  fs.writeFileSync(nextFile, 'export default function Page() {\n  return null;\n}\n', 'utf8');
+
+  try {
+    const tracker = new ShadowStateTracker(loadConfig({ workspaceRoot: tmpDir }));
+
+    const pyOut = tracker.ingest({
+      kind: 'terminal_error',
+      workspaceRoot: tmpDir,
+      message: `Traceback (most recent call last):\n  File "${pyFile}", line 2, in run\nZeroDivisionError: division by zero`,
+    });
+    assert.equal(path.resolve(pyOut.hotspot!.filePath), path.resolve(pyFile));
+    assert.equal(pyOut.hotspot!.hotspotRange?.startLine, 2);
+
+    const rsOut = tracker.ingest({
+      kind: 'terminal_error',
+      workspaceRoot: tmpDir,
+      message: `error[E0308]: mismatched types\n --> main.rs:2:18`,
+    });
+    assert.equal(path.resolve(rsOut.hotspot!.filePath), path.resolve(rustFile));
+    assert.equal(rsOut.hotspot!.hotspotRange?.startLine, 2);
+
+    const forwardSlashNext = nextFile.replace(/\\/g, '/');
+    const nextOut = tracker.ingest({
+      kind: 'diagnostic_error',
+      workspaceRoot: tmpDir,
+      message: `${forwardSlashNext}(2,3): error TS2322: Type is not assignable`,
+    });
+    assert.equal(path.resolve(nextOut.hotspot!.filePath), path.resolve(nextFile));
+    assert.equal(nextOut.hotspot!.hotspotRange?.startLine, 2);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

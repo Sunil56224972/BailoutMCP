@@ -1,10 +1,9 @@
 import http from 'node:http';
 import {
   constantTimeEqual,
+  pickSafeConfigUpdate,
   sanitizeConfigForDisplay,
-  type BailoutConfig,
   type BailoutEngine,
-  type BailoutProviderKind,
   type ManualBailoutOptions,
   type TelemetrySignal,
 } from '@bailout-mcp/core';
@@ -26,15 +25,6 @@ export interface BridgeServerOptions {
 const MAX_BODY_BYTES = 256 * 1024;
 const MAX_SSE_CLIENTS = 16;
 const SSE_HEARTBEAT_MS = 25_000;
-
-const ALLOWED_RUNTIME_PROVIDERS = new Set<BailoutProviderKind>([
-  'anthropic',
-  'gemini',
-  'openai',
-  'openrouter',
-  'ollama',
-  'custom',
-]);
 
 function readJsonBody<T>(req: http.IncomingMessage): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -261,52 +251,6 @@ export class LocalBridgeServer {
     return constantTimeEqual(token, this.token);
   }
 
-  private pickSafeConfigUpdate(body: Record<string, unknown>): Partial<BailoutConfig> {
-    // Strictly allow ONLY non-secret runtime tuning knobs over IPC/MCP.
-    // API keys, endpoint URLs, headers, and allowedWorkspaceRoots MUST come from local env/files.
-    const safe: Partial<BailoutConfig> = {};
-
-    if (
-      typeof body.provider === 'string' &&
-      ALLOWED_RUNTIME_PROVIDERS.has(body.provider as BailoutProviderKind)
-    ) {
-      safe.provider = body.provider as BailoutProviderKind;
-    }
-    if (
-      typeof body.stuckThreshold === 'number' &&
-      body.stuckThreshold >= 20 &&
-      body.stuckThreshold <= 100
-    ) {
-      safe.stuckThreshold = body.stuckThreshold;
-    }
-    if (
-      typeof body.pauseGateMs === 'number' &&
-      body.pauseGateMs >= 500 &&
-      body.pauseGateMs <= 30_000
-    ) {
-      safe.pauseGateMs = body.pauseGateMs;
-    }
-    if (
-      typeof body.cooldownMs === 'number' &&
-      body.cooldownMs >= 10_000 &&
-      body.cooldownMs <= 3_600_000
-    ) {
-      safe.cooldownMs = body.cooldownMs;
-    }
-    if (
-      typeof body.minConfidence === 'number' &&
-      body.minConfidence >= 0.3 &&
-      body.minConfidence <= 0.99
-    ) {
-      safe.minConfidence = body.minConfidence;
-    }
-    if (typeof body.autoSolve === 'boolean') {
-      safe.autoSolve = body.autoSolve;
-    }
-
-    return safe;
-  }
-
   private async handleRequest(
     req: http.IncomingMessage,
     res: http.ServerResponse,
@@ -346,6 +290,20 @@ export class LocalBridgeServer {
 
       if (method === 'GET' && url.pathname === '/v1/dossier') {
         sendJson(res, 200, { dossier: this.engine.getLastDossier() ?? null });
+        return;
+      }
+
+      if (method === 'GET' && url.pathname === '/v1/dossier/preview') {
+        const filePath = url.searchParams.get('filePath') ?? undefined;
+        const dossier = this.engine.previewDossier(filePath);
+        sendJson(res, 200, { dossier });
+        return;
+      }
+
+      if (method === 'POST' && url.pathname === '/v1/state/reset') {
+        const body = await readJsonBody<{ filePath?: string }>(req);
+        const snapshot = this.engine.resetState(body.filePath);
+        sendJson(res, 200, snapshot);
         return;
       }
 
@@ -398,7 +356,7 @@ export class LocalBridgeServer {
 
       if (method === 'POST' && url.pathname === '/v1/config') {
         const body = await readJsonBody<Record<string, unknown>>(req);
-        const safePartial = this.pickSafeConfigUpdate(body);
+        const safePartial = pickSafeConfigUpdate(body);
         const updated = this.engine.updateConfig(safePartial);
         sendJson(res, 200, { config: sanitizeConfigForDisplay(updated) });
         return;

@@ -47,6 +47,10 @@ export interface ManualBailoutOptions {
   filePath?: string;
   fileContentOverride?: string;
   force?: boolean;
+  errorMessage?: string;
+  attemptedFix?: string;
+  startLine?: number;
+  endLine?: number;
 }
 
 function safeReadTextFile(filePath: string, maxBytes: number): string | undefined {
@@ -94,11 +98,8 @@ export class BailoutEngine extends EventEmitter {
 
   constructor(configOverrides?: Partial<BailoutConfig>) {
     super();
-    this.explicitRootsLocked = Boolean(
-      (configOverrides?.allowedWorkspaceRoots && configOverrides.allowedWorkspaceRoots.length > 0) ||
-        process.env.BAILOUT_ALLOWED_ROOTS,
-    );
     this.config = loadConfig(configOverrides);
+    this.explicitRootsLocked = Boolean(this.config.explicitRootsLocked);
     this.tracker = new ShadowStateTracker(this.config);
     this.timingGate = new TimingGate(this.config);
     this.router = new BailoutRouter(this.config);
@@ -126,6 +127,69 @@ export class BailoutEngine extends EventEmitter {
 
   getLastDossier(): BailoutDossier | undefined {
     return this.lastDossier;
+  }
+
+  /**
+   * Distills and returns a secret-redacted BailoutDossier 100% locally without making
+   * any outbound LLM API calls — ideal for dry-run inspection or offline root-cause debugging.
+   */
+  previewDossier(filePath?: string, fileContentOverride?: string): BailoutDossier {
+    const now = Date.now();
+    const targetPath = filePath ?? this.tracker.getActiveFilePath();
+    if (!targetPath) {
+      throw new Error('No active filePath specified or tracked in Shadow-State.');
+    }
+    const safePath = assertSafeWorkspacePath(targetPath, this.config.allowedWorkspaceRoots);
+    let hotspot = this.tracker.getHotspot(safePath, now);
+    if (!hotspot) {
+      const { hotspot: created } = this.tracker.ingest({
+        kind: 'file_focus',
+        filePath: safePath,
+        timestamp: now,
+        source: 'mcp-client',
+      });
+      hotspot = created!;
+    }
+    const dossier = distillBailoutDossier(hotspot, this.config, { fileContentOverride });
+    this.lastDossier = dossier;
+    return dossier;
+  }
+
+  /**
+   * Resets Shadow-State friction debt for a single file or the entire workspace session.
+   */
+  resetState(filePath?: string, now = Date.now()): ShadowStateSnapshot {
+    if (filePath) {
+      this.tracker.resetFileFriction(filePath);
+      if (
+        this.pendingBailout &&
+        normalizeFilePath(this.pendingBailout.filePath) === normalizeFilePath(filePath)
+      ) {
+        const stale = this.pendingBailout;
+        stale.status = 'stale';
+        this.pendingBailout = undefined;
+        this.emit('bailout_invalidated', {
+          proposal: stale,
+          reason: 'Shadow-State friction explicitly reset for file.',
+        });
+      }
+    } else {
+      this.tracker.resetAll();
+      if (this.pendingBailout) {
+        const stale = this.pendingBailout;
+        stale.status = 'stale';
+        this.pendingBailout = undefined;
+        this.emit('bailout_invalidated', {
+          proposal: stale,
+          reason: 'Shadow-State session explicitly reset.',
+        });
+      }
+      this.lastError = undefined;
+    }
+
+    const snap = this.getSnapshot(now);
+    this.emit('state_changed', snap);
+    return snap;
   }
 
   /**
@@ -278,6 +342,21 @@ export class BailoutEngine extends EventEmitter {
       throw new Error(readiness.notice ?? 'No real bailout provider configured.');
     }
 
+    if (options.errorMessage || options.attemptedFix || options.startLine !== undefined) {
+      this.tracker.ingest({
+        kind: options.errorMessage ? 'agent_tool_error' : 'file_focus',
+        filePath: safePath,
+        timestamp: now,
+        source: 'mcp-client',
+        message: options.errorMessage,
+        attemptedFix: options.attemptedFix,
+        lineRange:
+          options.startLine !== undefined
+            ? { startLine: options.startLine, endLine: options.endLine ?? options.startLine }
+            : undefined,
+      });
+    }
+
     let hotspot = this.tracker.getHotspot(safePath, now);
     if (!hotspot) {
       const { hotspot: created } = this.tracker.ingest({
@@ -305,6 +384,24 @@ export class BailoutEngine extends EventEmitter {
 
   getPendingBailout(includeGated = true, now = Date.now()): BailoutProposal | undefined {
     if (!this.pendingBailout) return undefined;
+
+    // Auto-invalidate if the file on disk drifted externally (e.g. git checkout / external editor)
+    const current = safeReadTextFile(this.pendingBailout.filePath, this.config.maxFileSizeBytes);
+    if (
+      current !== undefined &&
+      !isProposalStillValidForContent(this.pendingBailout, current, this.config.maxPatchLines)
+    ) {
+      const stale = this.pendingBailout;
+      stale.status = 'stale';
+      this.pendingBailout = undefined;
+      this.emit('bailout_invalidated', {
+        proposal: stale,
+        reason: 'Target file changed externally before bailout was consumed.',
+      });
+      this.emit('state_changed', this.getSnapshot(now));
+      return undefined;
+    }
+
     if (includeGated) return this.pendingBailout;
     const hotspot = this.tracker.getHotspot(this.pendingBailout.filePath, now);
     const gate = this.timingGate.evaluate(now, hotspot?.cooldownUntil ?? 0);
@@ -335,6 +432,14 @@ export class BailoutEngine extends EventEmitter {
       appliedToDisk = outcome.applied;
       applyError = outcome.reason;
       if (!outcome.applied) {
+        // Prevent wedging the engine forever on an unapplicable stale proposal
+        proposal.status = 'stale';
+        this.pendingBailout = undefined;
+        this.emit('bailout_invalidated', {
+          proposal,
+          reason: applyError ?? 'Patch could not be applied to disk.',
+        });
+        this.emit('state_changed', this.getSnapshot(now));
         return { proposal, appliedToDisk: false, applyError };
       }
     }
@@ -477,9 +582,6 @@ export class BailoutEngine extends EventEmitter {
 
     this.solvingFiles.add(key);
     this.lastError = undefined;
-    this.stats.bailoutsTriggered += 1;
-    this.bailoutTimestamps.push(now);
-    this.pruneBudgetWindow(now);
 
     this.emit('bailout_solving', {
       filePath: hotspot.filePath,
@@ -493,6 +595,11 @@ export class BailoutEngine extends EventEmitter {
         fileContentOverride,
       });
       this.lastDossier = dossier;
+
+      // Charge rate-limit budget only once local dossier validation passes and outbound solve begins
+      this.stats.bailoutsTriggered += 1;
+      this.bailoutTimestamps.push(now);
+      this.pruneBudgetWindow(now);
 
       const result = await this.router.solve(dossier);
 

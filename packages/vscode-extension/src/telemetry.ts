@@ -28,7 +28,7 @@ export interface LocalSignalPayload {
 export type SignalEmitter = (signal: LocalSignalPayload) => void;
 
 const SENSITIVE_FILE_RE =
-  /(^|[\\/])(\.env(\..+)?|\.npmrc|\.netrc|\.pypirc|\.git-credentials|credentials(\.json)?|secrets?\.(json|ya?ml)|id_(rsa|dsa|ecdsa|ed25519)|master\.key)$|\.(pem|key|p12|pfx|kdbx|sqlite|sqlite3|db|ovpn|asc|gpg)$/i;
+  /(^|[\\/])(\.env(\..+)?|\.npmrc|\.netrc|\.pypirc|\.dockercfg|\.git-credentials|authorized_keys|known_hosts|credentials(\.json)?|service-account\.json|bridge\.json|shadow|passwd|secrets?\.(json|ya?ml)|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|master\.key)$|(?:^|[\\/._-])(secret|secrets|credential|credentials|privatekey|private_key)(?:[._-]|$)|\.(pem|key|p12|pfx|jks|keystore|kdbx|crt|der|sqlite|sqlite3|db|ovpn|asc|gpg)$/i;
 const SENSITIVE_DIR_RE =
   /(^|[\\/])(\.ssh|\.aws|\.gnupg|\.kube|\.bailout-mcp|\.docker|\.gcloud|\.azure)([\\/]|$)/i;
 

@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { isProviderConfigured } from './config.js';
 import type { BailoutConfig } from './types.js';
 
 const SENSITIVE_BASENAMES = new Set([
@@ -254,11 +255,11 @@ const DANGEROUS_NEW_CODE_RULES: DangerousPatchRule[] = [
   { label: 'new Function()', pattern: /\bnew\s+Function\s*\(/i },
   {
     label: 'child_process execution',
-    pattern: /\b(child_process|execSync|spawnSync|execFileSync)\b/,
+    pattern: /\b(child_process|execSync|spawnSync|execFileSync|execFile|spawn)\b/,
   },
   {
     label: 'destructive filesystem deletion',
-    pattern: /\bfs\.(rmSync|rmdirSync|unlinkSync)\s*\(/,
+    pattern: /\bfs\.(?:promises\.)?(rmSync|rmdirSync|unlinkSync|rm|rmdir)\s*\(/,
   },
   {
     label: 'remote dynamic import',
@@ -270,9 +271,13 @@ const DANGEROUS_NEW_CODE_RULES: DangerousPatchRule[] = [
   },
   {
     label: 'encoded powershell execution',
-    pattern: /\bpowershell\b[^\n]*-(enc|encodedcommand)\b/i,
+    pattern: /\b(powershell|pwsh)\b[^\n]*-(enc|encodedcommand)\b/i,
   },
   { label: 'destructive recursive delete', pattern: /\brm\s+-rf\s+\/(\s|$)/i },
+  {
+    label: 'redaction placeholder overwrite',
+    pattern: /\[REDACTED_[A-Z0-9_]+\]/,
+  },
 ];
 
 export interface PatchSafetyResult {
@@ -324,11 +329,7 @@ export function sanitizeConfigForDisplay(
     const providerKey = name as keyof BailoutConfig['providers'];
     const configured = isConfiguredFn
       ? isConfiguredFn(providerKey, config)
-      : name === 'ollama'
-        ? config.provider === 'ollama' && Boolean(creds.baseUrl && creds.model)
-        : name === 'custom'
-          ? Boolean(creds.baseUrl && creds.model)
-          : Boolean(creds.apiKey && creds.model);
+      : isProviderConfigured(providerKey, config);
     providers[name] = {
       model: creds.model,
       baseUrl: creds.baseUrl,

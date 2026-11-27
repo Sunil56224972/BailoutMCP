@@ -135,8 +135,23 @@ const SECRET_RULES: SecretRule[] = [
   },
   {
     name: 'aws-access-key',
-    pattern: /\bAKIA[0-9A-Z]{16}\b/g,
+    pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/g,
     replacement: '[REDACTED_AWS_KEY]',
+  },
+  {
+    name: 'gitlab-token',
+    pattern: /\bglpat-[A-Za-z0-9_-]{20,}\b/g,
+    replacement: '[REDACTED_GITLAB_TOKEN]',
+  },
+  {
+    name: 'pypi-token',
+    pattern: /\bpypi-[A-Za-z0-9_-]{32,}\b/g,
+    replacement: '[REDACTED_PYPI_TOKEN]',
+  },
+  {
+    name: 'url-query-secret',
+    pattern: /([?&](?:api_key|apikey|access_token|auth_token|client_secret|secret|token)=)([^&\s"'`]{8,})/gi,
+    replacement: '$1[REDACTED_URL_SECRET]',
   },
   {
     name: 'db-connection-uri',
@@ -187,6 +202,9 @@ export function redactSecrets(input: string): RedactionResult {
       }
       if (rule.name === 'bearer-or-basic-auth') {
         return `${args[1] as string} [REDACTED_AUTH]`;
+      }
+      if (rule.name === 'url-query-secret') {
+        return `${args[1] as string}[REDACTED_URL_SECRET]`;
       }
       return rule.replacement;
     });

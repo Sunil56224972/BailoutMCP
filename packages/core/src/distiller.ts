@@ -9,10 +9,15 @@ function inferLanguage(filePath: string): string {
   const map: Record<string, string> = {
     '.ts': 'typescript',
     '.tsx': 'tsx',
+    '.mts': 'typescript',
+    '.cts': 'typescript',
     '.js': 'javascript',
     '.jsx': 'jsx',
     '.mjs': 'javascript',
     '.cjs': 'javascript',
+    '.vue': 'vue',
+    '.svelte': 'svelte',
+    '.astro': 'astro',
     '.py': 'python',
     '.go': 'go',
     '.rs': 'rust',
@@ -20,16 +25,61 @@ function inferLanguage(filePath: string): string {
     '.cs': 'csharp',
     '.cpp': 'cpp',
     '.c': 'c',
+    '.h': 'c',
+    '.hpp': 'cpp',
     '.rb': 'ruby',
     '.php': 'php',
     '.swift': 'swift',
     '.kt': 'kotlin',
+    '.scala': 'scala',
+    '.dart': 'dart',
+    '.lua': 'lua',
+    '.ex': 'elixir',
+    '.exs': 'elixir',
+    '.sol': 'solidity',
+    '.zig': 'zig',
+    '.sh': 'bash',
+    '.bash': 'bash',
+    '.ps1': 'powershell',
+    '.prisma': 'prisma',
+    '.graphql': 'graphql',
     '.sql': 'sql',
+    '.toml': 'toml',
     '.json': 'json',
     '.yaml': 'yaml',
     '.yml': 'yaml',
   };
   return map[ext] ?? 'text';
+}
+
+const HEADER_LINE_RE =
+  /^\s*(?:import\s|from\s+\S+\s+import\s|const\s+\S+\s*=\s*require\(|use\s+|package\s+|#include\s|using\s+|export\s+(?:type|interface)\s|type\s+\w+|interface\s+\w+|\/\/|\/\*|\*)/;
+
+function extractTopOfFileContext(
+  lines: string[],
+  windowStartLine: number,
+  shouldRedact: boolean,
+): { headerText?: string; redactedCount: number } {
+  if (windowStartLine <= 3) return { redactedCount: 0 };
+
+  const maxHeaderLine = Math.min(windowStartLine - 1, 30);
+  const selected: string[] = [];
+  for (let i = 0; i < maxHeaderLine && selected.length < 20; i++) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    if (HEADER_LINE_RE.test(line) || i < 8) {
+      const clipped = line.length > 300 ? `${line.slice(0, 300)} /* [truncated] */` : line;
+      selected.push(`${String(i + 1).padStart(4, ' ')} | ${clipped}`);
+    }
+  }
+
+  if (selected.length === 0) return { redactedCount: 0 };
+  const joined = selected.join('\n');
+  if (!shouldRedact) {
+    return { headerText: joined, redactedCount: 0 };
+  }
+  const red = redactSecrets(joined);
+  return { headerText: red.text, redactedCount: red.redactedCount };
 }
 
 export interface DistillOptions {
@@ -106,6 +156,9 @@ export function distillBailoutDossier(
     .map((line, idx) => `${String(windowStartLine + idx).padStart(4, ' ')} | ${line}`)
     .join('\n');
 
+  const topHeader = extractTopOfFileContext(lines, windowStartLine, config.redactSecrets);
+  redactedSecretsCount += topHeader.redactedCount;
+
   const recurringErrors = hotspot.recurringErrors.slice(0, 3).map((err) => {
     let latestRaw = err.latestRaw;
     if (config.redactSecrets) {
@@ -137,6 +190,7 @@ export function distillBailoutDossier(
       startLine: centerStart,
       endLine: centerEnd,
     },
+    ...(topHeader.headerText ? { topOfFileContext: topHeader.headerText } : {}),
     numberedCodeWindow,
     rawCodeWindow: safeWindow,
     windowStartLine,

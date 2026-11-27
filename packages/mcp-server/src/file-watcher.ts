@@ -1,6 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { hashContent, isSensitiveFilePath, type BailoutEngine } from '@bailout-mcp/core';
+import {
+  hashContent,
+  isSensitiveFilePath,
+  normalizeFilePath,
+  type BailoutEngine,
+} from '@bailout-mcp/core';
 
 const IGNORED_SEGMENTS = new Set([
   'node_modules',
@@ -37,6 +42,8 @@ const CODE_EXTENSIONS = new Set([
   '.vue',
   '.svelte',
 ]);
+
+const MAX_WATCHED_HASH_ENTRIES = 250;
 
 /**
  * CLI-friendly local file watcher that detects rapid save-churn and A->B->A
@@ -87,6 +94,7 @@ export class WorkspaceChurnWatcher {
   }
 
   private shouldIgnore(relativePath: string): boolean {
+    if (relativePath.includes('.bailout-tmp-')) return true;
     const ext = path.extname(relativePath).toLowerCase();
     if (!CODE_EXTENSIONS.has(ext)) return true;
     const parts = relativePath.split(/[\\/]/);
@@ -94,18 +102,19 @@ export class WorkspaceChurnWatcher {
   }
 
   private scheduleInspect(filePath: string): void {
-    const prev = this.debounceTimers.get(filePath);
+    const key = normalizeFilePath(filePath);
+    const prev = this.debounceTimers.get(key);
     if (prev) clearTimeout(prev);
 
     const timer = setTimeout(() => {
-      this.debounceTimers.delete(filePath);
-      this.inspectFile(filePath);
+      this.debounceTimers.delete(key);
+      this.inspectFile(filePath, key);
     }, 300);
     timer.unref();
-    this.debounceTimers.set(filePath, timer);
+    this.debounceTimers.set(key, timer);
   }
 
-  private inspectFile(filePath: string): void {
+  private inspectFile(filePath: string, canonicalKey: string): void {
     try {
       if (isSensitiveFilePath(filePath)) return;
       if (!fs.existsSync(filePath)) return;
@@ -115,10 +124,11 @@ export class WorkspaceChurnWatcher {
       const content = fs.readFileSync(filePath, 'utf8');
       const currentHash = hashContent(content);
       const now = Date.now();
-      const prev = this.lastHashes.get(filePath);
+      const prev = this.lastHashes.get(canonicalKey);
 
       if (!prev) {
-        this.lastHashes.set(filePath, { hash: currentHash, at: now, rapidSaves: 1 });
+        this.pruneHashCache();
+        this.lastHashes.set(canonicalKey, { hash: currentHash, at: now, rapidSaves: 1 });
         this.engine.ingest({
           kind: 'file_focus',
           filePath,
@@ -130,9 +140,17 @@ export class WorkspaceChurnWatcher {
 
       if (prev.hash === currentHash) return;
 
+      // Avoid recording self-inflicted edit churn while file is in post-accept/post-bailout cooldown
+      const snap = this.engine.getSnapshot(now);
+      const fileHotspot = snap.hotspots.find((h) => normalizeFilePath(h.filePath) === canonicalKey);
+      if (fileHotspot && now < fileHotspot.cooldownUntil) {
+        this.lastHashes.set(canonicalKey, { hash: currentHash, at: now, rapidSaves: 0 });
+        return;
+      }
+
       const deltaMs = now - prev.at;
       const rapidSaves = deltaMs <= 45_000 ? prev.rapidSaves + 1 : 1;
-      this.lastHashes.set(filePath, { hash: currentHash, at: now, rapidSaves });
+      this.lastHashes.set(canonicalKey, { hash: currentHash, at: now, rapidSaves });
 
       if (rapidSaves >= 2) {
         this.engine.ingest(
@@ -156,6 +174,21 @@ export class WorkspaceChurnWatcher {
       }
     } catch {
       // Ignore transient read lock errors while editors save atomically
+    }
+  }
+
+  private pruneHashCache(): void {
+    if (this.lastHashes.size < MAX_WATCHED_HASH_ENTRIES) return;
+    let oldestKey: string | undefined;
+    let oldestAt = Number.POSITIVE_INFINITY;
+    for (const [k, v] of this.lastHashes.entries()) {
+      if (v.at < oldestAt) {
+        oldestAt = v.at;
+        oldestKey = k;
+      }
+    }
+    if (oldestKey) {
+      this.lastHashes.delete(oldestKey);
     }
   }
 }

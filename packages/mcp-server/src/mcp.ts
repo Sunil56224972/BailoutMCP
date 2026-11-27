@@ -3,6 +3,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import {
   BailoutEngine,
+  pickSafeConfigUpdate,
   sanitizeConfigForDisplay,
   type BailoutConfig,
   type BailoutDossier,
@@ -25,6 +26,8 @@ export interface BailoutBackend {
   ): Promise<{ proposal: BailoutProposal; appliedToDisk: boolean; applyError?: string }>;
   dismissBailout(id?: string): Promise<BailoutProposal | null>;
   getLastDossier(): Promise<BailoutDossier | null>;
+  previewDossier(filePath?: string): Promise<BailoutDossier>;
+  resetState(filePath?: string): Promise<ShadowStateSnapshot>;
   updateConfig(partial: Partial<BailoutConfig>): Promise<Record<string, unknown>>;
 }
 
@@ -55,8 +58,15 @@ class EmbeddedBackend implements BailoutBackend {
   async getLastDossier(): Promise<BailoutDossier | null> {
     return this.engine.getLastDossier() ?? null;
   }
+  async previewDossier(filePath?: string): Promise<BailoutDossier> {
+    return this.engine.previewDossier(filePath);
+  }
+  async resetState(filePath?: string): Promise<ShadowStateSnapshot> {
+    return this.engine.resetState(filePath);
+  }
   async updateConfig(partial: Partial<BailoutConfig>): Promise<Record<string, unknown>> {
-    return sanitizeConfigForDisplay(this.engine.updateConfig(partial));
+    const safe = pickSafeConfigUpdate(partial as Record<string, unknown>);
+    return sanitizeConfigForDisplay(this.engine.updateConfig(safe));
   }
 }
 
@@ -117,6 +127,10 @@ export function createBailoutMcpServer(backend: BailoutBackend): McpServer {
         'error_resolved',
       ]),
       filePath: z.string().optional().describe('Absolute path to the file being worked on'),
+      workspaceRoot: z
+        .string()
+        .optional()
+        .describe('Workspace root directory used to infer source file paths from stack traces'),
       startLine: z.number().int().positive().optional(),
       endLine: z.number().int().positive().optional(),
       message: z.string().optional().describe('Error text, stderr snippet, or hesitation context'),
@@ -134,6 +148,7 @@ export function createBailoutMcpServer(backend: BailoutBackend): McpServer {
           kind: args.kind,
           source: 'mcp-client',
           filePath: args.filePath,
+          workspaceRoot: args.workspaceRoot,
           lineRange:
             args.startLine !== undefined
               ? { startLine: args.startLine, endLine: args.endLine ?? args.startLine }
@@ -201,11 +216,22 @@ export function createBailoutMcpServer(backend: BailoutBackend): McpServer {
     'Distill a secret-redacted minimal dossier for a workspace file and escalate to the configured real heavy reasoning model (Anthropic Opus, Gemini Pro, OpenAI, OpenRouter, local Ollama, or custom LiteLLM router) for a validated surgical patch.',
     {
       filePath: z.string().optional().describe('Target workspace file path (defaults to current hotspot)'),
+      errorMessage: z.string().optional().describe('Optional latest compiler/test/runtime error message'),
+      attemptedFix: z.string().optional().describe('Optional summary of prior failed fix attempts'),
+      startLine: z.number().int().positive().optional().describe('Optional 1-indexed hotspot start line'),
+      endLine: z.number().int().positive().optional().describe('Optional 1-indexed hotspot end line'),
       force: z.boolean().optional().default(false).describe('Bypass hourly/daily rate cap'),
     },
-    async ({ filePath, force }) => {
+    async ({ filePath, errorMessage, attemptedFix, startLine, endLine, force }) => {
       try {
-        const proposal = await backend.triggerBailout({ filePath, force });
+        const proposal = await backend.triggerBailout({
+          filePath,
+          errorMessage,
+          attemptedFix,
+          startLine,
+          endLine,
+          force,
+        });
         return {
           content: [{ type: 'text', text: JSON.stringify(proposal, null, 2) }],
         };
@@ -267,7 +293,9 @@ export function createBailoutMcpServer(backend: BailoutBackend): McpServer {
         .enum(['anthropic', 'gemini', 'openai', 'openrouter', 'ollama', 'custom'])
         .optional(),
       stuckThreshold: z.number().min(20).max(100).optional(),
+      frictionThreshold: z.number().min(10).max(95).optional(),
       pauseGateMs: z.number().min(500).max(30_000).optional(),
+      cooldownMs: z.number().min(10_000).max(3_600_000).optional(),
       minConfidence: z.number().min(0.3).max(0.99).optional(),
       autoSolve: z.boolean().optional(),
     },
@@ -276,6 +304,47 @@ export function createBailoutMcpServer(backend: BailoutBackend): McpServer {
         const updated = await backend.updateConfig(args);
         return {
           content: [{ type: 'text', text: JSON.stringify(updated, null, 2) }],
+        };
+      } catch (err) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // 8. Tool: preview_dossier (100% local, works even when routerReady === false)
+  server.tool(
+    'preview_dossier',
+    'Distill and inspect the secret-redacted local BailoutDossier (hotspot score, normalized recurring error fingerprints, top-of-file imports, numbered code window, and attempted fixes) 100% locally with zero external API calls. Ideal when routerReady is false or before triggering escalation.',
+    {
+      filePath: z.string().optional().describe('Target workspace file path (defaults to current hotspot)'),
+    },
+    async ({ filePath }) => {
+      try {
+        const dossier = await backend.previewDossier(filePath);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(dossier, null, 2) }],
+        };
+      } catch (err) {
+        return mcpError(err);
+      }
+    },
+  );
+
+  // 9. Tool: reset_shadow_state
+  server.tool(
+    'reset_shadow_state',
+    'Clear Shadow-State frustration debt and stale bailout proposals for a specific file or for the entire workspace session when switching tasks.',
+    {
+      filePath: z
+        .string()
+        .optional()
+        .describe('Optional file path to reset; omit to reset the entire workspace session'),
+    },
+    async ({ filePath }) => {
+      try {
+        const snapshot = await backend.resetState(filePath);
+        return {
+          content: [{ type: 'text', text: JSON.stringify(snapshot, null, 2) }],
         };
       } catch (err) {
         return mcpError(err);

@@ -74,6 +74,15 @@ function buildUserPrompt(dossier: BailoutDossier): string {
     'Prior Attempted Fixes:',
     attemptsBlock,
     '',
+    ...(dossier.topOfFileContext
+      ? [
+          'Top-of-File Imports & Type Context (for symbol/import reference only):',
+          `<UNTRUSTED_IMPORTS_${nonce}>`,
+          dossier.topOfFileContext,
+          `</UNTRUSTED_IMPORTS_${nonce}>`,
+          '',
+        ]
+      : []),
     `Focused Code Window (Lines ${dossier.windowStartLine}-${dossier.windowEndLine}, Hotspot around ${dossier.hotspotRange.startLine}-${dossier.hotspotRange.endLine}):`,
     `<UNTRUSTED_CODE_${nonce}>`,
     dossier.numberedCodeWindow,
@@ -85,20 +94,64 @@ function buildUserPrompt(dossier: BailoutDossier): string {
     .join('\n');
 }
 
+function scanBalancedJsonObject(text: string): string | null {
+  const start = text.indexOf('{');
+  if (start === -1) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth += 1;
+    } else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
 function extractJsonObject(rawText: string): RawModelBailoutResponse {
   const trimmed = rawText.trim();
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  const candidate = fenced ? fenced[1].trim() : trimmed;
-
-  const firstBrace = candidate.indexOf('{');
-  const lastBrace = candidate.lastIndexOf('}');
-  if (firstBrace === -1 || lastBrace === -1 || lastBrace <= firstBrace) {
-    throw new Error('Model response did not contain a valid JSON object.');
+  if (!trimmed) {
+    throw new Error('Model response was empty (did not contain a JSON object).');
   }
 
-  const parsed = JSON.parse(
-    candidate.slice(firstBrace, lastBrace + 1),
-  ) as Partial<RawModelBailoutResponse>;
+  let parsed: Partial<RawModelBailoutResponse> | undefined;
+
+  // 1. Try direct JSON.parse first (safe when code strings inside JSON contain ``` fences)
+  try {
+    parsed = JSON.parse(trimmed) as Partial<RawModelBailoutResponse>;
+  } catch {
+    // 2. Strip outer markdown code fence ONLY if the response itself starts with ```
+    let unwrapped = trimmed;
+    if (/^```(?:json)?\s/i.test(unwrapped)) {
+      unwrapped = unwrapped.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim();
+    }
+    const balanced = scanBalancedJsonObject(unwrapped);
+    if (!balanced) {
+      throw new Error('Model response did not contain a valid JSON object.');
+    }
+    parsed = JSON.parse(balanced) as Partial<RawModelBailoutResponse>;
+  }
 
   if (
     !parsed ||
@@ -242,7 +295,11 @@ export class BailoutRouter {
     const data = (await res.json()) as {
       content?: Array<{ type: string; text?: string }>;
     };
-    const text = data.content?.find((c) => c.type === 'text')?.text ?? '';
+    const text =
+      data.content
+        ?.filter((c) => c.type === 'text' && typeof c.text === 'string')
+        .map((c) => c.text!)
+        .join('\n') ?? '';
     return extractJsonObject(text);
   }
 
@@ -274,7 +331,7 @@ export class BailoutRouter {
         contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
         generationConfig: {
           temperature: 0.1,
-          maxOutputTokens: 1800,
+          maxOutputTokens: 4096,
           responseMimeType: 'application/json',
         },
       }),
@@ -285,9 +342,16 @@ export class BailoutRouter {
     }
 
     const data = (await res.json()) as {
-      candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      candidates?: Array<{
+        content?: { parts?: Array<{ text?: string; thought?: boolean }> };
+      }>;
     };
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '';
+    const parts = data.candidates?.[0]?.content?.parts ?? [];
+    const nonThoughtText = parts
+      .filter((p) => !p.thought && typeof p.text === 'string')
+      .map((p) => p.text!)
+      .join('\n');
+    const text = nonThoughtText || (parts.find((p) => typeof p.text === 'string')?.text ?? '');
     return extractJsonObject(text);
   }
 
@@ -368,11 +432,12 @@ export class BailoutRouter {
     };
 
     if (reasoningModel) {
-      // OpenAI o1/o3/o4 models require max_completion_tokens and reject temperature overrides
-      body.max_completion_tokens = 2500;
+      // OpenAI o1/o3/o4 reasoning models count reasoning tokens inside max_completion_tokens
+      // and reject temperature overrides
+      body.max_completion_tokens = 8192;
     } else {
       body.temperature = 0.1;
-      body.max_tokens = 1800;
+      body.max_tokens = 2400;
     }
 
     const res = await fetch(endpoint, {

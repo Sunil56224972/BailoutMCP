@@ -9,11 +9,15 @@ import os from 'node:os';
 import path from 'node:path';
 
 const FRICTION_HINT_RE =
-  /\b(still (broken|failing|not working|getting)|same error|didn'?t work|does not work|doesn'?t work|try again|undo that|that'?s wrong|stuck|looping)\b/i;
+  /\b(still (broken|failing|not working|getting|wrong|errors?)|same (error|bug|issue)|didn'?t work|does not work|doesn'?t work|try again|undo that|revert that|that'?s wrong|wrong again|broken again|fails? again|stop guessing|going in circles|infinite loop|stuck|looping)\b/i;
 
 function readManifest() {
   try {
-    const p = path.join(os.homedir(), '.bailout-mcp', 'bridge.json');
+    const dir =
+      process.env.BAILOUT_HOME && process.env.BAILOUT_HOME.trim()
+        ? path.resolve(process.env.BAILOUT_HOME.trim())
+        : path.join(os.homedir(), '.bailout-mcp');
+    const p = path.join(dir, 'bridge.json');
     if (!fs.existsSync(p)) return null;
     return JSON.parse(fs.readFileSync(p, 'utf8'));
   } catch {

@@ -2,24 +2,66 @@
 /**
  * Claude Code `PostToolUse` hook for BailoutMCP.
  * - Never blocks Claude Code (strict 350ms local HTTP timeout).
- * - Only records genuine execution/edit errors (never triggers false positives on Read/Grep output).
- * - Passes `workspaceRoot` so stack-trace file inference works even when Bash commands omit `filePath`.
- * - Injects a pre-solved heavy-model bailout into Claude Code when ready.
+ * - Records genuine execution/edit errors AND green test/build resolutions (Micro-Win resets).
+ * - Computes privacy-preserving SHA-256 `regionHash` on edits to catch A->B->A oscillation loops.
+ * - Deduplicates repeated full-diff injections per bailout proposal ID.
  */
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 const MUTATING_OR_EXEC_TOOLS = new Set(['Bash', 'Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const VERIFICATION_CMD_RE =
+  /\b(npm|pnpm|yarn|bun|npx|cargo|go|pytest|python3?\s+-m\s+pytest|vitest|jest|mocha|tsc|biome|eslint|ruff|mypy|gradle|mvn|dotnet)\b.*\b(test|check|typecheck|build|lint|verify)\b|\b(pytest|vitest|jest|tsc)\b/i;
+const STRING_FAILURE_RE =
+  /(?:^|\n)\s*(?:Exit code [1-9]\d*|Command failed|FAIL\s+\S+|ERROR:|Traceback \(most recent call last\)|error\[E\d+\]:|error TS\d+:)/;
+
+function getBailoutDir() {
+  if (process.env.BAILOUT_HOME && process.env.BAILOUT_HOME.trim()) {
+    return path.resolve(process.env.BAILOUT_HOME.trim());
+  }
+  return path.join(os.homedir(), '.bailout-mcp');
+}
 
 function readManifest() {
   try {
-    const p = path.join(os.homedir(), '.bailout-mcp', 'bridge.json');
+    const p = path.join(getBailoutDir(), 'bridge.json');
     if (!fs.existsSync(p)) return null;
     return JSON.parse(fs.readFileSync(p, 'utf8'));
   } catch {
     return null;
   }
+}
+
+function wasProposalAlreadyInjectedFull(proposalId) {
+  try {
+    const stateFile = path.join(getBailoutDir(), 'hook-state.json');
+    if (!fs.existsSync(stateFile)) return false;
+    const data = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+    return data?.lastInjectedId === proposalId && Date.now() - (data?.injectedAt ?? 0) < 120_000;
+  } catch {
+    return false;
+  }
+}
+
+function markProposalInjected(proposalId) {
+  try {
+    const dir = getBailoutDir();
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, 'hook-state.json'),
+      JSON.stringify({ lastInjectedId: proposalId, injectedAt: Date.now() }),
+      { encoding: 'utf8', mode: 0o600 },
+    );
+  } catch {
+    // Non-fatal
+  }
+}
+
+function hashSnippet(text) {
+  if (!text || typeof text !== 'string') return undefined;
+  return crypto.createHash('sha256').update(text).digest('hex').slice(0, 16);
 }
 
 async function readStdin() {
@@ -65,19 +107,28 @@ async function main() {
     typeof payload.cwd === 'string' && payload.cwd ? payload.cwd : process.cwd();
 
   const filePath =
-    toolInput.file_path ?? toolInput.path ?? toolInput.filePath ?? undefined;
+    toolInput.file_path ?? toolInput.notebook_path ?? toolInput.path ?? toolInput.filePath ?? undefined;
 
-  const stderrText =
-    typeof toolResp?.stderr === 'string'
-      ? toolResp.stderr
-      : typeof toolResp === 'string'
-        ? toolResp
-        : JSON.stringify(toolResp ?? {}).slice(0, 1000);
+  const combinedOutput =
+    typeof toolResp === 'string'
+      ? toolResp
+      : [toolResp?.stderr, toolResp?.stdout, toolResp?.error]
+          .filter((s) => typeof s === 'string' && s.length > 0)
+          .join('\n') || JSON.stringify(toolResp ?? {}).slice(0, 1000);
+
+  const numericExit =
+    typeof toolResp?.exit_code === 'number'
+      ? toolResp.exit_code
+      : typeof toolResp?.exitCode === 'number'
+        ? toolResp.exitCode
+        : undefined;
 
   const isExplicitError =
-    Boolean(toolResp?.is_error || toolResp?.isError) ||
-    (typeof toolResp?.exit_code === 'number' && toolResp.exit_code !== 0) ||
-    (typeof toolResp?.exitCode === 'number' && toolResp.exitCode !== 0);
+    Boolean(toolResp?.is_error || toolResp?.isError || toolResp?.error) ||
+    (numericExit !== undefined && numericExit !== 0) ||
+    (toolName === 'Bash' && numericExit === undefined && STRING_FAILURE_RE.test(combinedOutput));
+
+  const commandStr = String(toolInput.command ?? '');
 
   if (isExplicitError) {
     await callBridge(manifest, '/v1/signals', {
@@ -87,11 +138,37 @@ async function main() {
         filePath,
         workspaceRoot,
         code: toolName,
-        message: stderrText.slice(0, 600),
+        exitCode: numericExit,
+        message: combinedOutput.slice(0, 900),
         ...(process.env.ANTHROPIC_MODEL ? { agentModel: process.env.ANTHROPIC_MODEL } : {}),
       },
     });
-  } else if (toolName === 'Edit' || toolName === 'Write' || toolName === 'MultiEdit') {
+  } else if (toolName === 'Bash' && VERIFICATION_CMD_RE.test(commandStr)) {
+    // Test/build/typecheck command succeeded — emit error_resolved to trigger Micro-Win reset
+    await callBridge(manifest, '/v1/signals', {
+      signal: {
+        kind: 'error_resolved',
+        source: 'claude-hook',
+        filePath,
+        workspaceRoot,
+        message: `Verification succeeded: ${commandStr.slice(0, 100)}`,
+      },
+    });
+    return;
+  } else if (
+    toolName === 'Edit' ||
+    toolName === 'Write' ||
+    toolName === 'MultiEdit' ||
+    toolName === 'NotebookEdit'
+  ) {
+    const editedBody =
+      toolInput.new_string ??
+      toolInput.content ??
+      (Array.isArray(toolInput.edits)
+        ? toolInput.edits.map((e) => e?.new_string ?? '').join('\n')
+        : undefined);
+    const regionHash = hashSnippet(editedBody);
+
     await callBridge(manifest, '/v1/signals', {
       signal: {
         kind: 'edit_churn',
@@ -99,6 +176,7 @@ async function main() {
         filePath,
         workspaceRoot,
         count: 1,
+        ...(regionHash ? { regionHash } : {}),
         attemptedFix: `${toolName} on ${filePath ? path.basename(filePath) : 'file'}`,
       },
     });
@@ -107,19 +185,26 @@ async function main() {
   const pending = await callBridge(manifest, '/v1/bailout/pending?includeGated=true');
   if (pending?.proposal) {
     const p = pending.proposal;
-    const output = {
-      hookSpecificOutput: {
-        hookEventName: 'PostToolUse',
-        additionalContext: [
+    const alreadySentFull = wasProposalAlreadyInjectedFull(p.id);
+    markProposalInjected(p.id);
+
+    const contextLines = alreadySentFull
+      ? [
+          `[BailoutMCP Reminder] Pre-solved fix ${p.id} from ${p.model} (${Math.round(p.confidence * 100)}% conf) is still pending for ${path.basename(p.filePath)}: "${p.summary}". Call get_pending_bailout / accept_bailout("${p.id}") or dismiss_bailout("${p.id}").`,
+        ]
+      : [
           `[BailoutMCP Pre-Solved Rescue Available from ${p.model} (${Math.round(p.confidence * 100)}% conf)]`,
           `Offer to user: ${p.offerMessage}`,
           `Root Cause: ${p.rootCause}`,
           p.whyPreviousAttemptsFailed ? `Why prior loop failed: ${p.whyPreviousAttemptsFailed}` : '',
           `Surgical Diff:\n${p.patch.unifiedDiff}`,
-          `If the user agrees, apply this fix and call BailoutMCP's accept_bailout(id="${p.id}").`,
-        ]
-          .filter(Boolean)
-          .join('\n'),
+          `If the user agrees, apply this fix and call BailoutMCP's accept_bailout(id="${p.id}"). If declined, call dismiss_bailout(id="${p.id}").`,
+        ];
+
+    const output = {
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUse',
+        additionalContext: contextLines.filter(Boolean).join('\n'),
       },
     };
     process.stdout.write(JSON.stringify(output));

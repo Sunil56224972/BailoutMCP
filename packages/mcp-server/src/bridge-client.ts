@@ -113,6 +113,19 @@ export class BridgeClient {
     return res.dossier;
   }
 
+  async previewDossier(filePath?: string): Promise<BailoutDossier> {
+    const query = filePath ? `?filePath=${encodeURIComponent(filePath)}` : '';
+    const res = await this.request<{ dossier: BailoutDossier }>(
+      'GET',
+      `/v1/dossier/preview${query}`,
+    );
+    return res.dossier;
+  }
+
+  async resetState(filePath?: string): Promise<ShadowStateSnapshot> {
+    return this.request<ShadowStateSnapshot>('POST', '/v1/state/reset', { filePath });
+  }
+
   async updateConfig(partial: Partial<BailoutConfig>): Promise<Record<string, unknown>> {
     const res = await this.request<{ config: Record<string, unknown> }>(
       'POST',
