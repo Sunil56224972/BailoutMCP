@@ -80,9 +80,9 @@ const STACK_PATTERNS: Array<{ re: RegExp; pathIdx: number; lineIdx: number }> = 
     pathIdx: 1,
     lineIdx: 2,
   },
-  // POSIX / relative path (including Next.js [id], (group), @scope), supporting :line:col or (line,col)
+  // POSIX / relative path (including Next.js [id], /app/(group)/, @scope), supporting :line:col or (line,col)
   {
-    re: /((?:\.{0,2}[\\/])?[A-Za-z0-9_.@[\]()/-]+\.[A-Za-z0-9]{1,8})(?::(\d+)(?::\d+)?|\((\d+),\d+\))/g,
+    re: /((?:\.{0,2}[\\/]|[A-Za-z0-9_@[])[A-Za-z0-9_.@[\]()/-]*\.[A-Za-z0-9]{1,8})(?::(\d+)(?::\d+)?|\((\d+),\d+\))/g,
     pathIdx: 1,
     lineIdx: 2,
   },
@@ -112,7 +112,7 @@ function inferFileFromErrorText(
   for (const { re, pathIdx, lineIdx } of STACK_PATTERNS) {
     re.lastIndex = 0;
     for (const match of message.matchAll(re)) {
-      const rawPath = match[pathIdx]?.trim();
+      const rawPath = match[pathIdx]?.trim().replace(/^\(+/, '');
       if (
         !rawPath ||
         rawPath.startsWith('node:') ||
